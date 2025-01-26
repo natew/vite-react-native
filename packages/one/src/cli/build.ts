@@ -2,7 +2,8 @@ import FSExtra from 'fs-extra'
 import MicroMatch from 'micromatch'
 import { createRequire } from 'node:module'
 import Path, { join, relative, resolve } from 'node:path'
-import type { OutputAsset, RollupOutput } from 'rollup'
+import type { OutputAsset, OutputChunk, RollupOutput } from 'rollup'
+import { isMatching, match, P } from 'ts-pattern'
 import { nodeExternals } from 'rollup-plugin-node-externals'
 import { mergeConfig, build as viteBuild, type InlineConfig } from 'vite'
 import {
@@ -20,11 +21,16 @@ import { getManifest } from '../vite/getManifest'
 import { loadUserOneOptions } from '../vite/loadConfig'
 import { runWithAsyncLocalContext } from '../vite/one-server-only'
 import type { One, RouteInfo } from '../vite/types'
+import { createApiServerlessFunction } from '../vercel/build/generate/createApiServerlessFunction'
 import { buildPage } from './buildPage'
 import { checkNodeVersion } from './checkNodeVersion'
 import { labelProcess } from './label-process'
+import { createSsrServerlessFunction } from '../vercel/build/generate/createSSRServerlessFunction'
+// import { fileURLToPath } from 'node:url'
+// import path from 'node:path'
+// const dirname =  typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url))
 
-const { ensureDir } = FSExtra
+const { ensureDir, readFile, outputFile, writeJSON } = FSExtra
 
 process.on('uncaughtException', (err) => {
   console.error(err?.message || err)
@@ -182,9 +188,11 @@ export async function build(args: {
     return output as RollupOutput
   }
 
+  let apiOutput: RollupOutput | null = null
   if (manifest.apiRoutes.length) {
     console.info(`\n 🔨 build api routes\n`)
-    await buildCustomRoutes('api', manifest.apiRoutes)
+    apiOutput = await buildCustomRoutes('api', manifest.apiRoutes)
+    console.info("[one.build] apiOutput", apiOutput)
   }
 
   const builtMiddlewares: Record<string, string> = {}
@@ -478,23 +486,91 @@ export async function build(args: {
     constants: JSON.parse(JSON.stringify({ ...constants })) as any,
   }
 
-  await FSExtra.writeJSON(toAbsolute(`dist/buildInfo.json`), buildInfoForWriting)
+  await writeJSON(toAbsolute(`dist/buildInfo.json`), buildInfoForWriting)
 
   let postBuildLogs: string[] = []
 
   const platform = oneOptions.web?.deploy ?? options.server?.platform
-
+  postBuildLogs.push("[one.build] platform", platform)
+  const compiltedApiRoutes = apiOutput?.output.filter(o => isMatching({ code: P.string, facadeModuleId: P.string }, o)) ?? []
   switch (platform) {
     case 'vercel': {
-      await FSExtra.writeFile(
-        join(options.root, 'dist', 'index.js'),
-        `import { serve } from 'one/serve'
-export const handler = await serve()
-export const { GET, POST, PUT, PATCH, OPTIONS } = handler`
-      )
+      for (const route of buildInfoForWriting.manifest.apiRoutes) {
+        const compiledRoute = compiltedApiRoutes.find(compiled => {
+          const flag = compiled.facadeModuleId.includes(route.file.replace('./',''))
+          // postBuildLogs.push("[vercel] apiRoute matching???", `${flag}`, route.file, compiledRoute.facadeModuleId)
+          return flag
+        })
+        if (compiledRoute) {
+          // postBuildLogs.push('[vercel] apiRoute matched', route.page, compiledRoute?.facadeModuleId)
+          await createApiServerlessFunction(route.page, compiledRoute.code, options, postBuildLogs)
+        } else {
+          // postBuildLogs.push("[vercel] apiRoute unmatched", route.file)
+        }
+      }
 
-      postBuildLogs.push(`wrote vercel entry to: ${join('.', 'dist', 'index.js')}`)
-      postBuildLogs.push(`point vercel outputDirectory to dist`)
+      for (const route of buildInfoForWriting.manifest.pageRoutes) {
+        // postBuildLogs.push('[vercel] pageRoute', route.type, route.page, JSON.stringify(route))
+        switch (route.type) {
+          case "ssr": // Server Side Rendered
+            // const f = manifest.pageRoutes.find(pageRoute => pageRoute.file === route.file)
+            // postBuildLogs.push('[vercel] pageRoute', route.type, route.page, JSON.stringify(route), 'pageRoute', JSON.stringify(f))
+            // const builtPageRoute = builtRoutes.find(pageRoute => pageRoute.routeFile === route.file)
+            const builtPageRoute = routeToBuildInfo[route.file]
+            if (builtPageRoute) {
+              postBuildLogs.push('[vercel] pageRoute', route.type, route.page, JSON.stringify(route), 'pagebuiltPageRouteRoute', JSON.stringify(builtPageRoute))
+              await createSsrServerlessFunction(route.page, builtPageRoute, options, postBuildLogs)
+            }
+            break;
+          case "ssg": // Static Site Generation
+          case "spa": // Single Page Application
+          default:
+            // no-op, these will be copied from built dist/client into .vercel/output/static
+            // postBuildLogs.push('[vercel] pageRoute will be copied to .vercel/output/static', route.type, route.page)
+            break;
+        }
+      }
+
+      const vercelMiddlewareDir = join(options.root, 'dist', '.vercel/output/functions/_middleware');
+      await ensureDir(vercelMiddlewareDir);
+      postBuildLogs.push(`[one.build] copying middlewares from ${join(options.root, 'dist', 'middlewares')} to ${vercelMiddlewareDir}`)
+      await moveAllFiles(join(options.root, 'dist', 'middlewares'), vercelMiddlewareDir)
+      postBuildLogs.push(`[one.build] writing package.json to ${join(vercelMiddlewareDir, 'package.json')}`);
+      await writeJSON(
+        join(vercelMiddlewareDir, 'package.json'),
+        { "type": "module" }
+      )
+      postBuildLogs.push(`[one.build] writing .vc-config.json to ${join(vercelMiddlewareDir, '.vc-config.json')}`);
+      await writeJSON(join(vercelMiddlewareDir, '.vc-config.json'), {
+        runtime: "nodejs20.x",
+        handler: "_middleware.js",
+        launcherType: "Nodejs",
+        shouldAddHelpers: true,
+        shouldAddSourceMapSupport: true
+      });
+
+      const vercelOutputStaticDir = join(options.root, 'dist', '.vercel/output/static');
+      await ensureDir(vercelOutputStaticDir);
+
+      // await FSExtra.copy(htmlOutPath, funcFolder, { overwrite: true })
+      postBuildLogs.push(`[one.build] copying static files from ${clientDir} to ${vercelOutputStaticDir}`)
+      await moveAllFiles(clientDir, vercelOutputStaticDir)
+
+//       await FSExtra.writeFile(
+//         join(options.root, 'dist', 'index.js'),
+//         `import { serve } from 'one/serve'
+// export const handler = await serve()
+// export const { GET, POST, PUT, PATCH, OPTIONS } = handler`
+//       )
+
+      // Documentation - Vercel Build Output v3 config.json
+      // https://vercel.com/docs/build-output-api/v3/configuration#config.json-supported-properties
+      const vercelConfigFilePath = join(options.root, 'dist', '.vercel/output', 'config.json')
+      await writeJSON(
+        vercelConfigFilePath,
+        { version: 3 }
+      )
+      postBuildLogs.push(`[one.build] wrote vercel config to: ${vercelConfigFilePath}`)
 
       break
     }
