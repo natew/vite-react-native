@@ -36,7 +36,7 @@ jobs:
   #   name: iOS Development Integration Test
   #   needs:
   #     - build-ios-test-dev-container
-  #   runs-on: macos-14
+  #   runs-on: macOS
   #   defaults:
   #     run:
   #       working-directory: ${{ env.test_app_path }}
@@ -161,7 +161,7 @@ jobs:
     # * We do not test `react-native/scripts/react-native-xcode.sh`, instead we copy parts of it into our test scripts, simulating parts of the build process without running the whole native build.
     needs:
       - build-ios-test-app
-    runs-on: macos-14
+    runs-on: macOS
     defaults:
       run:
         working-directory: ${{ env.test_app_path }}
@@ -206,6 +206,11 @@ jobs:
       - name: Patch Packages
         run: |
           yarn one patch
+
+      - name: Setup upterm session
+        uses: lhotari/action-upterm@v1
+        with:
+          limit-access-to-users: zetavg
 
       # Prebuild and pod install because we need hermesc which is installed by pod install
       - name: Prebuild

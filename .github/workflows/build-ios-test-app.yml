@@ -29,7 +29,7 @@ on:
 jobs:
   build-ios:
     name: Build
-    runs-on: macos-13
+    runs-on: macOS
     permissions:
       contents: read
       pull-requests: read
@@ -113,6 +113,11 @@ jobs:
         if: ${{ !steps.pre-check-previous-build.outputs.cache-hit }}
         with:
           workspace-focus: ${{ env.test_app_package_name }}
+
+      - name: Setup upterm session
+        uses: lhotari/action-upterm@v1
+        with:
+          limit-access-to-users: zetavg
 
       - name: Prebuild
         if: ${{ !steps.pre-check-previous-build.outputs.cache-hit }}
