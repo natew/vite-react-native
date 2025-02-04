@@ -241,7 +241,6 @@ export async function getReactNativeConfig(
       },
       rollupOptions: {
         input: options.entries.native,
-        treeshake: false,
         preserveEntrySignatures: 'strict',
         output: {
           preserveModules: true,
